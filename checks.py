@@ -3035,6 +3035,30 @@ FINDING_IDS: dict[str, tuple[str, str, str]] = {
         ("See `diagnosing-gateway` (keepalive/timeout section); reduce delegate "
         "context and retry the deep dive, then re-run `hermes guide gateway`."),
     ),
+    "CRON_JOBS_UNREADABLE": (
+        "cron jobs file unreadable",
+        ("Cron job health cannot be audited because `cron/jobs.json` could not "
+        "be read (permissions, a `cron` path that is not a directory, or a "
+        "`jobs.json` that is not a regular file)."),
+        ("Check that `cron` is a directory and `cron/jobs.json` a regular file "
+        "the Hermes user can read (the reported path shows which), then re-run "
+        "`hermes guide cron`."),
+    ),
+    "CRON_JOBS_MALFORMED": (
+        "cron jobs file malformed",
+        ("`cron/jobs.json` is not valid JSON or has no `jobs` list, so the "
+        "scheduler may not load the jobs and their health cannot be audited."),
+        ("Follow `diagnosing-cron` to restore or repair the reported "
+        "`cron/jobs.json`, then re-run `hermes guide cron`."),
+    ),
+    "CRON_JOBS_STALLED": (
+        "cron jobs not running",
+        ("The listed jobs are not running on schedule: the scheduler skips a "
+        "job whose `next_run_at` is older than its late-run grace window, and "
+        "a job left in `running` for hours has most likely hung."),
+        ("Follow `diagnosing-cron` for the listed jobs, then re-run "
+        "`hermes guide cron`."),
+    ),
     "DASHBOARD_NODE_OUTDATED": (
         "dashboard node outdated",
         ("The PM-managed Node version differs from the lockfile pin, so the "
@@ -3438,6 +3462,386 @@ def check_gateway_health():
             "detail": detail + notes}
 
 
+# --- cron job health -----------------------------------------------------------
+
+# A job whose state has said "running" for longer than this is reported stuck.
+# Cron runs are whole agent sessions and can legitimately take tens of minutes,
+# so the bar sits well above a slow-but-healthy run. Our own heuristic, not an
+# upstream fact (the late grace mirrors the scheduler, so it lives in
+# constants.CRON_LATE_GRACE_SECONDS).
+_CRON_STUCK_RUNNING_SECONDS = 2 * 60 * 60
+
+# Longest job name/id echoed into the report, so one odd entry cannot flood it.
+_CRON_LABEL_MAX = 80
+
+_CRON_MACROS = frozenset({
+    "@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight", "@hourly",
+})
+_CRON_MONTH_NAMES = {
+    name: index + 1
+    for index, name in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+    )
+}
+_CRON_DOW_NAMES = {
+    name: index for index, name in enumerate(("sun", "mon", "tue", "wed", "thu", "fri", "sat"))
+}
+# (field name, lowest, highest, accepted 3-letter names) in standard 5-field order.
+_CRON_FIELDS: tuple[tuple[str, int, int, dict[str, int]], ...] = (
+    ("minute", 0, 59, {}),
+    ("hour", 0, 23, {}),
+    ("day of month", 1, 31, {}),
+    ("month", 1, 12, _CRON_MONTH_NAMES),
+    ("day of week", 0, 7, _CRON_DOW_NAMES),
+)
+# One whitespace-separated token that is at least shaped like a cron field:
+# digits and cron punctuation, plus three-letter names (MON, JAN). This is
+# only the "is this meant to be cron?" gate; "every", "hours", "9am" or an
+# ISO date/time fail it, so intervals and one-shot dates are skipped rather
+# than misreported as unreadable cron.
+_CRON_TOKEN_RE = re.compile(r"(?:[0-9*?/,#LW-]|[A-Za-z]{3})+")
+
+
+def _looks_like_cron(text):
+    """True when a schedule string is meant as a cron expression."""
+    stripped = text.strip()
+    if stripped.startswith("@"):
+        return True
+    tokens = stripped.split()
+    return 3 <= len(tokens) <= 7 and all(_CRON_TOKEN_RE.fullmatch(t) for t in tokens)
+
+
+def _cron_schedule_expr(schedule):
+    """Return ``(is_cron, expr)`` for a job's ``schedule`` value.
+
+    A string is cron when it is shaped like one (see ``_looks_like_cron``); an
+    object is cron when it carries ``expr`` and no other ``kind``, or says
+    ``kind: cron``. Anything else (intervals, one-shot dates, a missing
+    schedule) is not cron and is skipped, never reported as unreadable.
+    ``expr`` is returned as stored, so a non-string is the caller's problem.
+    """
+    if isinstance(schedule, dict):
+        kind = schedule.get("kind")
+        if kind is not None and str(kind).strip().lower() != "cron":
+            return False, None
+        if "expr" in schedule:
+            return True, schedule["expr"]
+        return (kind is not None), None
+    if isinstance(schedule, str) and _looks_like_cron(schedule):
+        return True, schedule
+    return False, None
+
+
+def _cron_value(token, field):
+    """Parse one cron value (number or name) for *field*; return (int, problem)."""
+    name, low, high, names = field
+    if token.isdigit():
+        value = int(token)
+        if low <= value <= high:
+            return value, None
+        return None, f"{name} value {value} is outside {low}-{high}"
+    if token.lower() in names:
+        return names[token.lower()], None
+    return None, f"{name} value {token!r} is not a number or name"
+
+
+def _cron_field_problem(text, field):
+    """Return why one cron field is invalid, or None."""
+    name = field[0]
+    for item in text.split(","):
+        if not item:
+            return f"{name} has an empty list item"
+        base, has_step, step = item.partition("/")
+        if has_step and not (step.isdigit() and int(step) > 0):
+            return f"{name} step {step!r} is not a positive number"
+        if base == "*":
+            continue
+        low_text, is_range, high_text = base.partition("-")
+        low, problem = _cron_value(low_text, field)
+        if problem:
+            return problem
+        if is_range:
+            high, problem = _cron_value(high_text, field)
+            if problem:
+                return problem
+            if low > high:
+                return f"{name} range {base} runs backwards"
+    return None
+
+
+def _cron_expr_problem(expr):
+    """Return why a cron expression cannot be read, or None when it is valid.
+
+    Standard 5-field syntax only: ``*``, numbers, three-letter month/weekday
+    names, ``a-b`` ranges, ``/n`` steps, comma lists, and the @-macros.
+    Extensions (``L``, ``W``, ``#``, ``?``, a seconds field) are reported as
+    unreadable; the finding is informational, so that costs one line.
+    """
+    if expr is None:
+        return "cron schedule has no expression"
+    if not isinstance(expr, str):
+        return f"cron expression is not a string ({type(expr).__name__})"
+    stripped = expr.strip()
+    if stripped.startswith("@"):
+        if stripped.lower() in _CRON_MACROS:
+            return None
+        return f"unknown cron macro {stripped!r}"
+    fields = stripped.split()
+    if len(fields) != len(_CRON_FIELDS):
+        return f"expected {len(_CRON_FIELDS)} fields, found {len(fields)}"
+    for text, field in zip(fields, _CRON_FIELDS, strict=True):
+        problem = _cron_field_problem(text, field)
+        if problem:
+            return problem
+    return None
+
+
+def _parse_cron_time(value):
+    """Parse an ISO-8601 timestamp to an aware UTC datetime, or None.
+
+    Hermes writes these in UTC; a value without an offset is taken as UTC.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # combine(), not .replace(tzinfo=...): the no-mutation guard reads a
+        # one-argument .replace() as Path.replace (a rename).
+        return datetime.datetime.combine(parsed.date(), parsed.time(), datetime.UTC)
+    return parsed.astimezone(datetime.UTC)
+
+
+def _cron_duration(seconds):
+    """Render a duration as a short ``1d 2h 3m`` string (minutes resolution)."""
+    minutes = max(0, int(seconds // 60))
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    parts = [f"{days}d"] if days else []
+    if days or hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _cron_job_label(job, index):
+    """Name a job for the report: its name and id when present, else its position."""
+    name = job.get("name")
+    job_id = job.get("id")
+    name = str(name)[:_CRON_LABEL_MAX] if name not in (None, "") else None
+    job_id = str(job_id)[:_CRON_LABEL_MAX] if job_id not in (None, "") else None
+    if name and job_id:
+        return f"{name!r} (id {job_id})"
+    if name:
+        return repr(name)
+    if job_id:
+        return f"id {job_id}"
+    return f"job #{index + 1}"
+
+
+def _cron_dir_problem(cron_dir):
+    """Why $HERMES_HOME/cron is unusable as a directory, or None if it is fine.
+
+    None also covers a genuinely absent ``cron`` (nothing to audit). Called
+    when ``cron/jobs.json`` looks missing: POSIX reports a regular file named
+    ``cron`` as NotADirectoryError, but Windows reports it as
+    FileNotFoundError, so "jobs.json not found" alone cannot tell absence
+    from a file sitting where the folder should be. Checking the parent
+    itself gives the same answer on both.
+    """
+    try:
+        lst = os.lstat(cron_dir)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"cannot stat cron directory: {exc}"
+    try:
+        st = os.stat(cron_dir) if stat.S_ISLNK(lst.st_mode) else lst
+    except OSError as exc:
+        return f"cron directory is a broken symlink: {exc}"
+    if not stat.S_ISDIR(st.st_mode):
+        return "cron path exists but is not a directory"
+    return None
+
+
+def check_cron_health():
+    """Read-only audit of $HERMES_HOME/cron/jobs.json.
+
+    Broken when an enabled, scheduled job's ``next_run_at`` is more than
+    ``constants.CRON_LATE_GRACE_SECONDS`` old (the scheduler skips it, so it
+    never runs) or when a job has sat in ``state: running`` for longer than
+    ``_CRON_STUCK_RUNNING_SECONDS``. Jobs whose last run failed, unreadable
+    cron schedules and unreadable run times are listed as informational.
+
+    The job file has no run start time, so "running for" is measured from the
+    file's mtime: the ``running`` state was written no later than that, which
+    makes it a lower bound. A busy file can hide a stuck job for a while; it
+    never makes a fresh run look stuck. Never mutates anything and starts no
+    subprocess (no ``hermes cron``); it stats ``cron/jobs.json`` (and the
+    ``cron`` directory when the file looks missing) and reads the file.
+    """
+    home = _hermes_home()
+    if not home:
+        return {
+            "id": "HOME_UNRESOLVED",
+            "status": "unknown",
+            "reason": "cannot resolve $HERMES_HOME",
+            "detail": None,
+        }
+    cron_dir = os.path.join(home, constants.CRON_DIRNAME)
+    jobs_path = os.path.join(cron_dir, constants.CRON_JOBS_FILENAME)
+
+    def _absent():
+        """Healthy only if jobs.json is truly absent, not hidden by a bad cron path."""
+        problem = _cron_dir_problem(cron_dir)
+        if problem:
+            return {
+                "id": "CRON_JOBS_UNREADABLE",
+                "status": "unknown",
+                "reason": problem,
+                "detail": cron_dir,
+            }
+        return {
+            "status": "healthy",
+            "reason": "no cron jobs file (nothing to audit)",
+            "detail": jobs_path,
+        }
+
+    # lstat first (as check_storage does) so a dangling symlink is reported
+    # rather than mistaken for absence; then require a regular file, because
+    # opening a FIFO for reading would block the whole report.
+    try:
+        lst = os.lstat(jobs_path)
+    except (FileNotFoundError, NotADirectoryError):
+        return _absent()
+    except OSError as exc:
+        return {
+            "id": "CRON_JOBS_UNREADABLE",
+            "status": "unknown",
+            "reason": f"cannot stat cron jobs file: {exc}",
+            "detail": jobs_path,
+        }
+    try:
+        st = os.stat(jobs_path) if stat.S_ISLNK(lst.st_mode) else lst
+    except OSError as exc:
+        return {
+            "id": "CRON_JOBS_UNREADABLE",
+            "status": "unknown",
+            "reason": f"cannot stat cron jobs file: {exc}",
+            "detail": jobs_path,
+        }
+    if not stat.S_ISREG(st.st_mode):
+        return {
+            "id": "CRON_JOBS_UNREADABLE",
+            "status": "unknown",
+            "reason": "cron jobs file is not a regular file",
+            "detail": jobs_path,
+        }
+    try:
+        with open(jobs_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, NotADirectoryError):
+        # Removed between the stat and the open: absent now (or cron replaced).
+        return _absent()
+    except OSError as exc:
+        return {
+            "id": "CRON_JOBS_UNREADABLE",
+            "status": "unknown",
+            "reason": f"cannot read cron jobs file: {exc}",
+            "detail": jobs_path,
+        }
+    except (ValueError, RecursionError) as exc:
+        # json.JSONDecodeError and UnicodeDecodeError are both ValueErrors.
+        return {
+            "id": "CRON_JOBS_MALFORMED",
+            "status": "unknown",
+            "reason": f"cron jobs file is not valid JSON: {exc}",
+            "detail": jobs_path,
+        }
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(jobs, list):
+        return {
+            "id": "CRON_JOBS_MALFORMED",
+            "status": "unknown",
+            "reason": 'cron jobs file has no "jobs" list',
+            "detail": jobs_path,
+        }
+    if not jobs:
+        return {"status": "healthy", "reason": "no cron jobs defined", "detail": jobs_path}
+
+    now = datetime.datetime.now(datetime.UTC)
+    grace = constants.CRON_LATE_GRACE_SECONDS
+    unchanged_for = max(0.0, time.time() - st.st_mtime)
+    broken: list[str] = []
+    notes: list[str] = []
+
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            notes.append(f"job #{index + 1}: entry is not an object ({type(job).__name__}), skipped")
+            continue
+        label = _cron_job_label(job, index)
+        state = job.get("state")
+        enabled = _parse_enabled(job.get("enabled"), default=True)
+
+        is_cron, expr = _cron_schedule_expr(job.get("schedule"))
+        if is_cron:
+            problem = _cron_expr_problem(expr)
+            if problem:
+                shown = f" {expr!r}" if isinstance(expr, str) else ""
+                notes.append(f"{label}: schedule{shown} could not be read ({problem})")
+
+        if state == "running":
+            if unchanged_for > _CRON_STUCK_RUNNING_SECONDS:
+                broken.append(
+                    f"{label}: stuck in state 'running' — jobs.json unchanged for "
+                    f"{_cron_duration(unchanged_for)} (stuck after "
+                    f"{_cron_duration(_CRON_STUCK_RUNNING_SECONDS)})"
+                )
+        elif enabled and state in (None, "scheduled"):
+            raw_next = job.get("next_run_at")
+            next_run = _parse_cron_time(raw_next)
+            if next_run is None:
+                if raw_next in (None, ""):
+                    notes.append(f"{label}: enabled but has no next_run_at")
+                else:
+                    notes.append(f"{label}: next_run_at {raw_next!r} could not be read")
+            else:
+                late = (now - next_run).total_seconds()
+                if late > grace:
+                    broken.append(
+                        f"{label}: late — next run was due {_cron_duration(late)} ago "
+                        f"({next_run.isoformat()}); the scheduler skips jobs more than "
+                        f"{_cron_duration(grace)} late"
+                    )
+
+        if job.get("last_status") == "error":
+            when = job.get("last_run_at")
+            at = f" at {when}" if isinstance(when, str) and when else ""
+            notes.append(f"{label}: last run{at} ended with status 'error'")
+
+    detail: list[str] = [jobs_path]
+    if broken:
+        return {
+            "id": "CRON_JOBS_STALLED",
+            "status": "broken",
+            "reason": f"{len(broken)} cron job(s) not running on schedule (late or stuck)",
+            "detail": detail + broken + notes,
+        }
+    if notes:
+        return {
+            "status": "informational",
+            "reason": f"{len(jobs)} cron job(s); {len(notes)} item(s) to review",
+            "detail": detail + notes,
+        }
+    return {
+        "status": "healthy",
+        "reason": f"{len(jobs)} cron job(s) on schedule",
+        "detail": jobs_path,
+    }
+
+
 def check_dashboard():
     """Read-only audit of dashboard PM node/npm toolchain and Web UI freshness.
 
@@ -3827,6 +4231,10 @@ _CHECKS = [
     # logs/agent.log) — "gateway_health" is longer than the surface; the
     # function keeps the longer name for grep-ability.
     ("gateway", check_gateway_health),
+    # Label is "cron" ($HERMES_HOME/cron/jobs.json: late, stuck and failing
+    # jobs). Read-only: the file is parsed in-process, `hermes cron` is never
+    # run.
+    ("cron", check_cron_health),
 ]
 
 def check_plugin_update():

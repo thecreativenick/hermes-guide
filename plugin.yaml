@@ -2,7 +2,7 @@ name: hermes-guide
 version: 0.9.8
 description: >-
   Hermes checks across `config`, `mcp`, `skills`, `commands`, `hooks`, `plugins`,
-  `memories`, `sessions`, `storage`, `gateway`, `dashboard`, and `update`, plus tap playbooks; read-only.
+  `memories`, `sessions`, `storage`, `gateway`, `dashboard`, `update`, and `cron`, plus tap playbooks; read-only.
 manifest_version: 1
 api_version: 1
 license: MIT

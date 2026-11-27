@@ -188,7 +188,8 @@ def test_sessions_label_registered():
     assert "sessions" in checks.labels()
     assert "gateway" in checks.labels()
     assert "dashboard" in checks.labels()
-    assert len(checks.labels()) == 12
+    assert "cron" in checks.labels()
+    assert len(checks.labels()) == 13
 
 
 def test_repair_signature_without_free_model():

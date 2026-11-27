@@ -334,7 +334,8 @@ def test_update_label_registered():
     assert "update" in checks.labels()
     assert "gateway" in checks.labels()
     assert "dashboard" in checks.labels()
-    assert len(checks.labels()) == 12
+    assert "cron" in checks.labels()
+    assert len(checks.labels()) == 13
 
 
 def main() -> int:

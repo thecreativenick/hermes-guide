@@ -18,6 +18,9 @@ __all__ = [
     "CONFIG_PLUGINS_SECTION",
     "CREDENTIAL_POOL_CUSTOM_PREFIX",
     "CREDENTIAL_POOL_SIBLING_START",
+    "CRON_DIRNAME",
+    "CRON_JOBS_FILENAME",
+    "CRON_LATE_GRACE_SECONDS",
     "FOREIGN_MCP_KEYS",
     "HOOKS_ALLOWLIST_FILENAME",
     "HOOKS_DOCTOR_HEALTHY_SUMMARY",
@@ -159,6 +162,16 @@ HOOKS_ALLOWLIST_FILENAME = "shell-hooks-allowlist.json"
 BUNDLED_SKILLS_MANIFEST = ".bundled_manifest"
 SKILL_BUNDLES_DIRNAME = "skill-bundles"
 
+# Cron job store: $HERMES_HOME/cron/jobs.json, a {"jobs": [...]} document the
+# scheduler owns. check_cron_health() only reads it.
+CRON_DIRNAME = "cron"
+CRON_JOBS_FILENAME = "jobs.json"
+
+# The scheduler skips (never fires) a job whose next_run_at is more than this
+# many seconds in the past. Fixed 15 min for now; if Hermes changes the grace
+# (or makes it per-job), edit it here.
+CRON_LATE_GRACE_SECONDS = 15 * 60
+
 # `hermes hooks doctor` output wording this check parses (reword upstream ->
 # edit here, not a regex in checks.py).
 HOOKS_DOCTOR_NONE_CONFIGURED = "No shell hooks configured"
@@ -189,6 +202,7 @@ SKILL_FOR_SCOPE = {
     "dashboard": "diagnosing-runtime",
     "update": "diagnosing-update",
     "gateway": "diagnosing-gateway",
+    "cron": "diagnosing-cron",
 }
 
 # Near-duplicate detection budget: entries beyond this count skip the pairwise
